@@ -1,5 +1,25 @@
 # SwiftGit2
 
+> [!NOTE]
+> **This is [Anglesite](https://github.com/Anglesite/Anglesite-app)'s fork of
+> [mbernson/SwiftGit2](https://github.com/mbernson/SwiftGit2)**, itself a fork of the original
+> [SwiftGit2/SwiftGit2](https://github.com/SwiftGit2/SwiftGit2). It exists to carry one patch:
+> `Repository.commit(message:signature:)` now handles the first commit on a freshly-`git init`'d
+> (unborn HEAD) repository, instead of failing with `reference 'refs/heads/master' not found`.
+> See [SwiftGit2/SwiftGit2#174](https://github.com/SwiftGit2/SwiftGit2/issues/174) (open since
+> 2020) for the upstream bug report and the `stevengharris` comment this fix's shape follows, and
+> [Anglesite-app#640](https://github.com/Anglesite/Anglesite-app/issues/640) for why Anglesite
+> needs it (a Swift-native, in-process git library instead of shelling out to `/usr/bin/git`,
+> which App Sandbox blocks entirely).
+>
+> **Before making further direct modifications to this fork**, check whether an existing PR
+> (upstream at `SwiftGit2/SwiftGit2`, on `mbernson/SwiftGit2`, or already open here) already
+> covers the change — pull that in instead of re-implementing it, to keep this fork's diff
+> against upstream as small and mergeable-back as possible. As of 2026-07-10, neither upstream
+> nor `mbernson/SwiftGit2` has any open PR addressing #174 — only the issue-comment-level
+> proposal this fix follows — so the patch here is original, not a duplicate of in-flight work.
+> Re-check before adding anything new.
+
 > [!WARNING]
 > The SwiftGit2 maintainers are in the process of migrating SwiftGit2 to the Swift Package Manager.
 > 

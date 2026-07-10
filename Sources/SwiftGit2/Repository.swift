@@ -682,6 +682,13 @@ public final class Repository {
 
 	/// Perform a commit of the staged files with the specified message and signature,
 	/// assuming we are not doing a merge and using the current tip as the parent.
+	///
+	/// On an unborn HEAD (a freshly-`git_repository_init`'d repo with zero commits), there is no
+	/// parent to look up — `git_reference_name_to_id` fails and leaves `parentID` zeroed. In that
+	/// case this creates the first commit with no parents, exactly like `git commit` on an empty
+	/// repository has always done. Fixes anglesite/SwiftGit2#1 (mirrors
+	/// https://github.com/SwiftGit2/SwiftGit2/issues/174, open upstream since 2020; the fix shape
+	/// here follows stevengharris's proposal in that issue's comments).
 	public func commit(message: String, signature: Signature) -> Result<Commit, NSError> {
 		return unsafeIndex().flatMap { index in
 			defer { git_index_free(index) }
@@ -694,6 +701,9 @@ public final class Repository {
 			var parentID = git_oid()
 			let nameToIDResult = git_reference_name_to_id(&parentID, self.pointer, "HEAD")
 			guard nameToIDResult == GIT_OK.rawValue else {
+				if git_oid_iszero(&parentID) == 1 {
+					return commit(tree: OID(treeOID), parents: [], message: message, signature: signature)
+				}
 				return .failure(NSError(gitError: nameToIDResult, pointOfFailure: "git_reference_name_to_id"))
 			}
 			return commit(OID(parentID)).flatMap { parentCommit in
