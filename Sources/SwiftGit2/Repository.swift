@@ -632,6 +632,69 @@ public final class Repository {
 		}
 	}
 
+	/// Unstage `path` from the index and delete it from the working tree — `git rm`'s combined
+	/// index+disk removal (not `--cached`), mirroring `add(path:)`'s shape and pointer-lifetime
+	/// pattern. Fails if `path` isn't in the index. The working-tree delete is best-effort (not an
+	/// error) if the file is already gone, matching `git rm`'s own tolerance of an
+	/// already-missing file as long as it's still tracked. Added for anglesite/SwiftGit2
+	/// (Anglesite-app#640).
+	public func remove(path: String) -> Result<(), NSError> {
+		return unsafeIndex().flatMap { index in
+			defer { git_index_free(index) }
+			let removeResult = git_index_remove_bypath(index, path)
+			guard removeResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: removeResult, pointOfFailure: "git_index_remove_bypath"))
+			}
+			let writeResult = git_index_write(index)
+			guard writeResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: writeResult, pointOfFailure: "git_index_write"))
+			}
+			if let directoryURL {
+				try? FileManager.default.removeItem(at: directoryURL.appendingPathComponent(path))
+			}
+			return .success(())
+		}
+	}
+
+	/// Whether `path` exists in HEAD's tree — `cat-file -e HEAD:path`'s existence check, without a
+	/// full checkout. Returns `false` (not a `Result` failure) both when the path is genuinely
+	/// absent and when HEAD itself can't be resolved (e.g. an unborn repo with zero commits) —
+	/// callers use this as a go/no-go precondition, not a diagnostic, and both cases mean "there
+	/// is no HEAD copy to protect." Added for anglesite/SwiftGit2 (Anglesite-app#640).
+	public func headHasEntry(atPath path: String) -> Bool {
+		guard case .success(let head) = HEAD() else { return false }
+		var oid = head.oid.oid
+		var commitObject: OpaquePointer? = nil
+		guard git_object_lookup(&commitObject, self.pointer, &oid, GIT_OBJECT_COMMIT) == GIT_OK.rawValue,
+			let commitObject else { return false }
+		defer { git_object_free(commitObject) }
+		var entryObject: OpaquePointer? = nil
+		let result = git_object_lookup_bypath(&entryObject, commitObject, path, GIT_OBJECT_ANY)
+		if let entryObject { git_object_free(entryObject) }
+		return result == GIT_OK.rawValue
+	}
+
+	/// Restores exactly `path` in the working tree and index from HEAD — `git checkout HEAD --
+	/// path`'s scoped restore, not a full working-tree checkout. Used to roll back a
+	/// `remove(path:)` when a subsequent commit fails, so a failed delete never leaves the
+	/// repository in a state where the file is gone from disk with no commit recording its
+	/// removal. Added for anglesite/SwiftGit2 (Anglesite-app#640).
+	public func restorePathFromHEAD(_ path: String) -> Result<(), NSError> {
+		var dirPointer = UnsafeMutablePointer<Int8>(mutating: (path as NSString).utf8String)
+		let paths = withUnsafeMutablePointer(to: &dirPointer) {
+			git_strarray(strings: $0, count: 1)
+		}
+		var options = git_checkout_options()
+		git_checkout_init_options(&options, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
+		options.checkout_strategy = GIT_CHECKOUT_FORCE.rawValue
+		options.paths = paths
+		let result = git_checkout_head(self.pointer, &options)
+		guard result == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_checkout_head"))
+		}
+		return .success(())
+	}
+
 	/// Perform a commit with arbitrary numbers of parent commits.
 	public func commit(
 		tree treeOID: OID,
