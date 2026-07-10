@@ -781,7 +781,18 @@ public final class Repository {
 			var parentID = git_oid()
 			let nameToIDResult = git_reference_name_to_id(&parentID, self.pointer, "HEAD")
 			guard nameToIDResult == GIT_OK.rawValue else {
-				if git_oid_iszero(&parentID) == 1 {
+				// git_reference_name_to_id never writes to `parentID` on any failure path (see
+				// git_reference_lookup_resolved in libgit2's refs.c) — it stays whatever it was
+				// initialized to, so checking git_oid_iszero(&parentID) here would be true for
+				// EVERY failure, not just a genuinely unborn HEAD, and would silently create a
+				// parentless root commit on top of an existing history for transient/unrelated
+				// errors (permission issues, ref corruption, I/O errors). Key off the actual
+				// libgit2 error code instead: an unborn HEAD resolves "HEAD" -> a symbolic ref ->
+				// a direct ref that doesn't exist yet, which fails with GIT_ENOTFOUND at the
+				// final lookup (the same GIT_ENOTFOUND git_repository_head's own unborn-branch
+				// detection translates to GIT_EUNBORNBRANCH internally — see repository.c). Any
+				// other error code is a real failure and must propagate, not be papered over.
+				if nameToIDResult == GIT_ENOTFOUND.rawValue {
 					return commit(tree: OID(treeOID), parents: [], message: message, signature: signature)
 				}
 				return .failure(NSError(gitError: nameToIDResult, pointOfFailure: "git_reference_name_to_id"))
