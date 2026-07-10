@@ -594,6 +594,23 @@ public final class Repository {
 		return .success(index!)
 	}
 
+	/// Resolves the commit signature from the repository's git config (local, falling back to
+	/// global/system — the same chain `git config` itself walks via `git_signature_default`),
+	/// exactly as real `git commit` derives author/committer identity. Fails if
+	/// `user.name`/`user.email` aren't set anywhere in that chain, mirroring `git`'s own "Please
+	/// tell me who you are" refusal rather than inventing a fallback identity that would
+	/// misattribute commits. Added for anglesite/SwiftGit2 (Anglesite-app#640): a caller with no
+	/// subprocess `git` available has no other way to resolve the configured identity.
+	public func defaultSignature() -> Result<Signature, NSError> {
+		var signature: UnsafeMutablePointer<git_signature>? = nil
+		let result = git_signature_default(&signature, self.pointer)
+		guard result == GIT_OK.rawValue, let signature else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_signature_default"))
+		}
+		defer { git_signature_free(signature) }
+		return .success(Signature(signature.pointee))
+	}
+
 	/// Stage the file(s) under the specified path.
 	public func add(path: String) -> Result<(), NSError> {
 		var dirPointer = UnsafeMutablePointer<Int8>(mutating: (path as NSString).utf8String)
