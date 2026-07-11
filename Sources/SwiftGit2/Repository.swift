@@ -67,6 +67,65 @@ private func fetchOptions(credentials: Credentials) -> git_fetch_options {
 	return options
 }
 
+/// Payload threaded through libgit2's push callbacks. A class so the C callbacks can read the
+/// credentials and append per-ref rejections through an *unretained* pointer whose lifetime is
+/// scoped to the push call (`withExtendedLifetime` in `Repository.push`). Deliberately not the
+/// retain-transfer dance `credentialsCallback` does for fetch/clone: libgit2 may invoke the
+/// credential callback more than once per push (e.g. an auth retry), and `takeRetainedValue` on
+/// a second invocation would over-release. Added for anglesite/SwiftGit2 (Anglesite-app#653).
+private final class PushCallbackPayload {
+	let credentials: Credentials
+	var rejections: [String] = []
+
+	init(credentials: Credentials) {
+		self.credentials = credentials
+	}
+}
+
+/// Credential callback for push. Mirrors `credentialsCallback`'s credential construction but
+/// reads through `PushCallbackPayload` unretained (see its doc comment for why).
+private func pushCredentialsCallback(
+	cred: UnsafeMutablePointer<UnsafeMutablePointer<git_cred>?>?,
+	url: UnsafePointer<CChar>?,
+	username: UnsafePointer<CChar>?,
+	_: UInt32,
+	payload: UnsafeMutableRawPointer?) -> Int32 {
+
+	guard let payload = payload else { return -1 }
+	let holder = Unmanaged<PushCallbackPayload>.fromOpaque(payload).takeUnretainedValue()
+	let name = username.map(String.init(cString:))
+
+	let result: Int32
+	switch holder.credentials {
+	case .default:
+		result = git_cred_default_new(cred)
+	case .sshAgent:
+		result = git_cred_ssh_key_from_agent(cred, name!)
+	case .plaintext(let username, let password):
+		result = git_cred_userpass_plaintext_new(cred, username, password)
+	case .sshMemory(let username, let publicKey, let privateKey, let passphrase):
+		result = git_cred_ssh_key_memory_new(cred, username, publicKey, privateKey, passphrase)
+	}
+
+	return (result != GIT_OK.rawValue) ? -1 : 0
+}
+
+/// Per-ref result callback for push. libgit2 reports a *rejected* update (e.g. non-fast-forward)
+/// with a non-NULL `status` while `git_remote_push` itself can still return `GIT_OK`, so ignoring
+/// this callback would report a rejected push as success. `NULL` status means the ref was
+/// accepted.
+private func pushUpdateReferenceCallback(
+	refname: UnsafePointer<CChar>?,
+	status: UnsafePointer<CChar>?,
+	payload: UnsafeMutableRawPointer?) -> Int32 {
+
+	guard let status = status, let payload = payload else { return 0 }
+	let holder = Unmanaged<PushCallbackPayload>.fromOpaque(payload).takeUnretainedValue()
+	let ref = refname.map(String.init(cString:)) ?? "(unknown ref)"
+	holder.rejections.append("\(ref): \(String(cString: status))")
+	return 0
+}
+
 private func cloneOptions(bare: Bool = false, localClone: Bool = false, fetchOptions: git_fetch_options? = nil,
                           checkoutOptions: git_checkout_options? = nil) -> git_clone_options {
 	let pointer = UnsafeMutablePointer<git_clone_options>.allocate(capacity: 1)
@@ -100,13 +159,16 @@ public final class Repository {
 
 	/// Create a new repository at the given URL.
 	///
-	/// URL - The URL of the repository.
+	/// URL  - The URL of the repository.
+	/// bare - Create a bare repository (no working directory). Added for anglesite/SwiftGit2
+	///        (Anglesite-app#653): local push targets need a bare repository, since libgit2
+	///        refuses to push to the checked-out branch of a non-bare one.
 	///
 	/// Returns a `Result` with a `Repository` or an error.
-	public class func create(at url: URL) -> Result<Repository, NSError> {
+	public class func create(at url: URL, bare: Bool = false) -> Result<Repository, NSError> {
 		var pointer: OpaquePointer? = nil
 		let result = url.withUnsafeFileSystemRepresentation {
-			git_repository_init(&pointer, $0, 0)
+			git_repository_init(&pointer, $0, bare ? 1 : 0)
 		}
 
 		guard result == GIT_OK.rawValue else {
@@ -404,6 +466,77 @@ public final class Repository {
 		}
 	}
 
+	/// Add a new remote with the default fetch refspec — `git remote add <name> <url>`.
+	/// Added for anglesite/SwiftGit2 (Anglesite-app#653/#654).
+	public func addRemote(named name: String, url: String) -> Result<Remote, NSError> {
+		var pointer: OpaquePointer? = nil
+		let result = git_remote_create(&pointer, self.pointer, name, url)
+		guard result == GIT_OK.rawValue, let pointer = pointer else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_remote_create"))
+		}
+		defer { git_remote_free(pointer) }
+		return .success(Remote(pointer))
+	}
+
+	/// Push `refspec` to the named remote — `git push <remote> <refspec>` — authenticating via
+	/// `credentials`. Added for anglesite/SwiftGit2 (Anglesite-app#653).
+	///
+	/// A per-ref rejection from the receiving side (e.g. non-fast-forward) is reported as a
+	/// `.failure` carrying the ref and libgit2's status message, even though `git_remote_push`
+	/// itself returns `GIT_OK` in that case — see `pushUpdateReferenceCallback`.
+	public func push(remoteName: String, refspec: String, credentials: Credentials = .default) -> Result<(), NSError> {
+		return remoteLookup(named: remoteName) { lookup in
+			lookup.flatMap { remote in
+				let payload = PushCallbackPayload(credentials: credentials)
+				return withExtendedLifetime(payload) {
+					var options = git_push_options()
+					let resultInit = git_push_init_options(&options, UInt32(GIT_PUSH_OPTIONS_VERSION))
+					assert(resultInit == GIT_OK.rawValue)
+					options.callbacks.payload = Unmanaged.passUnretained(payload).toOpaque()
+					options.callbacks.credentials = pushCredentialsCallback
+					options.callbacks.push_update_reference = pushUpdateReferenceCallback
+
+					var refspecPointer = UnsafeMutablePointer<Int8>(mutating: (refspec as NSString).utf8String)
+					var refspecs = withUnsafeMutablePointer(to: &refspecPointer) {
+						git_strarray(strings: $0, count: 1)
+					}
+					let result = git_remote_push(remote, &refspecs, &options)
+					guard result == GIT_OK.rawValue else {
+						return .failure(NSError(gitError: result, pointOfFailure: "git_remote_push"))
+					}
+					guard payload.rejections.isEmpty else {
+						return .failure(NSError(
+							domain: libGit2ErrorDomain,
+							code: Int(GIT_ERROR.rawValue),
+							userInfo: [
+								NSLocalizedDescriptionKey: "push rejected: \(payload.rejections.joined(separator: "; "))",
+								NSLocalizedFailureReasonErrorKey: "git_remote_push failed."
+							]
+						))
+					}
+					return .success(())
+				}
+			}
+		}
+	}
+
+	/// Commit counts in each direction between two commits — `git rev-list --count
+	/// --left-right local...upstream`, via `git_graph_ahead_behind`. `ahead` is the number of
+	/// commits `local` has that `upstream` lacks; `behind` the reverse. Added for
+	/// anglesite/SwiftGit2 (Anglesite-app#653): the backup path's "unpushed commit on a clean
+	/// tree" check (Anglesite-app#246).
+	public func aheadBehind(local: OID, upstream: OID) -> Result<(ahead: Int, behind: Int), NSError> {
+		var ahead: size_t = 0
+		var behind: size_t = 0
+		var localOID = local.oid
+		var upstreamOID = upstream.oid
+		let result = git_graph_ahead_behind(&ahead, &behind, self.pointer, &localOID, &upstreamOID)
+		guard result == GIT_OK.rawValue else {
+			return .failure(NSError(gitError: result, pointOfFailure: "git_graph_ahead_behind"))
+		}
+		return .success((ahead: Int(ahead), behind: Int(behind)))
+	}
+
 	// MARK: - Reference Lookups
 
 	/// Load all the references with the given prefix (e.g. "refs/heads/")
@@ -624,6 +757,31 @@ public final class Repository {
 				return .failure(NSError(gitError: addResult, pointOfFailure: "git_index_add_all"))
 			}
 			// write index to disk
+			let writeResult = git_index_write(index)
+			guard writeResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: writeResult, pointOfFailure: "git_index_write"))
+			}
+			return .success(())
+		}
+	}
+
+	/// Stage every working-tree change — additions, modifications, AND deletions — like
+	/// `git add -A`. `add(path:)` alone (`git_index_add_all`) leaves entries for deleted files
+	/// in the index; the follow-up `git_index_update_all` is what removes them, matching git's
+	/// own `add -A` implementation. The empty pathspec matches everything. Added for
+	/// anglesite/SwiftGit2 (Anglesite-app#653).
+	public func addAll() -> Result<(), NSError> {
+		var emptyPathspec = git_strarray(strings: nil, count: 0)
+		return unsafeIndex().flatMap { index in
+			defer { git_index_free(index) }
+			let addResult = git_index_add_all(index, &emptyPathspec, 0, nil, nil)
+			guard addResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: addResult, pointOfFailure: "git_index_add_all"))
+			}
+			let updateResult = git_index_update_all(index, &emptyPathspec, nil, nil)
+			guard updateResult == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: updateResult, pointOfFailure: "git_index_update_all"))
+			}
 			let writeResult = git_index_write(index)
 			guard writeResult == GIT_OK.rawValue else {
 				return .failure(NSError(gitError: writeResult, pointOfFailure: "git_index_write"))
