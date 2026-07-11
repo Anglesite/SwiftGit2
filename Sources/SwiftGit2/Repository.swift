@@ -159,7 +159,7 @@ public final class Repository {
 
 	/// Create a new repository at the given URL.
 	///
-	/// URL  - The URL of the repository.
+	/// URL - The URL of the repository.
 	/// bare - Create a bare repository (no working directory). Added for anglesite/SwiftGit2
 	///        (Anglesite-app#653): local push targets need a bare repository, since libgit2
 	///        refuses to push to the checked-out branch of a non-bare one.
