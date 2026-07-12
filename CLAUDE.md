@@ -49,8 +49,8 @@ swift test                           # Swift Testing (@Suite/@Test), not XCTest/
   (SecureTransport, CommonCrypto).
 - Test suites that touch shared libgit2 state run `.serialized` — keep that on new suites;
   uncoordinated concurrent libgit2 use is unsafe.
-- CI (`.github/workflows/`) runs on pull requests. Open a PR to get a run; pushes to
-  `anglesite/main` alone do not trigger it (the `push:` trigger lists only `master`).
+- CI (`.github/workflows/`) runs on pull requests (any base branch for `BuildPR.yml`;
+  `test.yml` filters to `main`/`develop`/`anglesite/main`) and on pushes to those branches.
 
 ## API surface Anglesite-app depends on (do not break)
 
@@ -91,14 +91,25 @@ Sandbox blocks that exec just like it blocks `git`.
 
 ## Sharp edges to keep in mind
 
-- Nothing enforces `SwiftGit2Init()` — calling any API first fails at runtime with a libgit2
-  "library has not been initialized" class of error, not a compile error.
+- Libgit2 initialization is automatic: every `Repository` entry point
+  (`at`/`create`/`clone`/`isValid`) touches `LibGit2Bootstrap.ensureInitialized`. Explicit
+  `SwiftGit2Init()` still works (libgit2 refcounts), but only call `SwiftGit2Shutdown()` to
+  balance your own explicit init — dropping the count to zero pulls the rug out from under
+  the bootstrap.
 - `Repository` is not thread-safe and not `Sendable`. The app's pattern (open a fresh
   `Repository` per operation, run blocking calls off the cooperative pool) is the supported
   one.
-- Several inherited call sites let pointers from `withUnsafeMutablePointer` /
-  `NSString.utf8String` escape their guaranteed lifetimes (e.g. the `git_strarray`
-  construction in `add(path:)`/`push`/`restorePathFromHEAD`). It works today; don't copy the
-  pattern into new code — keep the C call inside the pointer's scope.
+- Build `git_strarray`s with the `withGitStrarray` helper in `Repository.swift` and keep the
+  libgit2 call inside its closure. Don't reintroduce the old pattern of letting pointers from
+  `withUnsafeMutablePointer`/`NSString.utf8String` escape their scope — it happened to work,
+  but is undefined behavior.
+- Remote-operation callbacks (fetch/clone/push) share `RemoteCallbackPayload` +
+  `credentialsCallback`, passed *unretained* with the payload's lifetime pinned by
+  `withExtendedLifetime` at the call site. Never hand libgit2 a `takeRetainedValue`-style
+  payload: the credential callback can fire multiple times (auth retries), and it may fire
+  zero times. The callback also bounds auth retries (`maxCredentialAttempts`) — call sites
+  map the resulting `GIT_EUSER` to a `GIT_EAUTH`-coded error.
+- Prefer the typed `NSError` helpers (`isLibGit2NotFound`, `isLibGit2AuthenticationFailure`,
+  `libGit2ErrorCode`) over string-matching `localizedDescription`.
 - `NSError(gitError:)` reads `giterr_last()`, which is thread-local — build the error on the
   same thread that made the failing libgit2 call.

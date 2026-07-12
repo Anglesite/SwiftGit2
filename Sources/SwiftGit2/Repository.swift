@@ -53,7 +53,10 @@ private func checkoutOptions(strategy: CheckoutStrategy,
 	return options
 }
 
-private func fetchOptions(credentials: Credentials) -> git_fetch_options {
+/// Fetch options wired to the shared `credentialsCallback`/`RemoteCallbackPayload` pair. The
+/// payload pointer is unretained — the caller owns the payload's lifetime and must keep it
+/// alive (`withExtendedLifetime`) across the libgit2 call these options are passed to.
+private func fetchOptions(payload: UnsafeMutableRawPointer) -> git_fetch_options {
 	let pointer = UnsafeMutablePointer<git_fetch_options>.allocate(capacity: 1)
 	git_fetch_init_options(pointer, UInt32(GIT_FETCH_OPTIONS_VERSION))
 
@@ -61,53 +64,28 @@ private func fetchOptions(credentials: Credentials) -> git_fetch_options {
 
 	pointer.deallocate()
 
-	options.callbacks.payload = credentials.toPointer()
+	options.callbacks.payload = payload
 	options.callbacks.credentials = credentialsCallback
 
 	return options
 }
 
-/// Payload threaded through libgit2's push callbacks. A class so the C callbacks can read the
-/// credentials and append per-ref rejections through an *unretained* pointer whose lifetime is
-/// scoped to the push call (`withExtendedLifetime` in `Repository.push`). Deliberately not the
-/// retain-transfer dance `credentialsCallback` does for fetch/clone: libgit2 may invoke the
-/// credential callback more than once per push (e.g. an auth retry), and `takeRetainedValue` on
-/// a second invocation would over-release. Added for anglesite/SwiftGit2 (Anglesite-app#653).
-private final class PushCallbackPayload {
-	let credentials: Credentials
-	var rejections: [String] = []
-
-	init(credentials: Credentials) {
-		self.credentials = credentials
+/// Runs `body` with a `git_strarray` viewing `strings`, whose storage is valid for exactly the
+/// duration of the call. Replaces an inherited pattern that let pointers from
+/// `withUnsafeMutablePointer`/`NSString.utf8String` escape their guaranteed lifetimes — which
+/// happened to work, but is undefined behavior. Keep every libgit2 call that reads the array
+/// inside `body`. Added for anglesite/SwiftGit2 (Anglesite-app#653).
+private func withGitStrarray<T>(_ strings: [String], _ body: (inout git_strarray) -> T) -> T {
+	var cStrings: [UnsafeMutablePointer<CChar>?] = strings.map { strdup($0) }
+	defer {
+		for cString in cStrings {
+			free(cString)
+		}
 	}
-}
-
-/// Credential callback for push. Mirrors `credentialsCallback`'s credential construction but
-/// reads through `PushCallbackPayload` unretained (see its doc comment for why).
-private func pushCredentialsCallback(
-	cred: UnsafeMutablePointer<UnsafeMutablePointer<git_cred>?>?,
-	url: UnsafePointer<CChar>?,
-	username: UnsafePointer<CChar>?,
-	_: UInt32,
-	payload: UnsafeMutableRawPointer?) -> Int32 {
-
-	guard let payload = payload else { return -1 }
-	let holder = Unmanaged<PushCallbackPayload>.fromOpaque(payload).takeUnretainedValue()
-	let name = username.map(String.init(cString:))
-
-	let result: Int32
-	switch holder.credentials {
-	case .default:
-		result = git_cred_default_new(cred)
-	case .sshAgent:
-		result = git_cred_ssh_key_from_agent(cred, name!)
-	case .plaintext(let username, let password):
-		result = git_cred_userpass_plaintext_new(cred, username, password)
-	case .sshMemory(let username, let publicKey, let privateKey, let passphrase):
-		result = git_cred_ssh_key_memory_new(cred, username, publicKey, privateKey, passphrase)
+	return cStrings.withUnsafeMutableBufferPointer { buffer in
+		var array = git_strarray(strings: buffer.baseAddress, count: size_t(strings.count))
+		return body(&array)
 	}
-
-	return (result != GIT_OK.rawValue) ? -1 : 0
 }
 
 /// Per-ref result callback for push. libgit2 reports a *rejected* update (e.g. non-fast-forward)
@@ -120,7 +98,7 @@ private func pushUpdateReferenceCallback(
 	payload: UnsafeMutableRawPointer?) -> Int32 {
 
 	guard let status = status, let payload = payload else { return 0 }
-	let holder = Unmanaged<PushCallbackPayload>.fromOpaque(payload).takeUnretainedValue()
+	let holder = Unmanaged<RemoteCallbackPayload>.fromOpaque(payload).takeUnretainedValue()
 	let ref = refname.map(String.init(cString:)) ?? "(unknown ref)"
 	holder.rejections.append("\(ref): \(String(cString: status))")
 	return 0
@@ -166,6 +144,7 @@ public final class Repository {
 	///
 	/// Returns a `Result` with a `Repository` or an error.
 	public class func create(at url: URL, bare: Bool = false) -> Result<Repository, NSError> {
+		LibGit2Bootstrap.ensureInitialized
 		var pointer: OpaquePointer? = nil
 		let result = url.withUnsafeFileSystemRepresentation {
 			git_repository_init(&pointer, $0, bare ? 1 : 0)
@@ -185,6 +164,7 @@ public final class Repository {
 	///
 	/// Returns a `Result` with a `Repository` or an error.
 	public class func at(_ url: URL) -> Result<Repository, NSError> {
+		LibGit2Bootstrap.ensureInitialized
 		var pointer: OpaquePointer? = nil
 		let result = url.withUnsafeFileSystemRepresentation {
 			git_repository_open(&pointer, $0)
@@ -212,24 +192,31 @@ public final class Repository {
 	public class func clone(from remoteURL: URL, to localURL: URL, localClone: Bool = false, bare: Bool = false,
 	                        credentials: Credentials = .default, checkoutStrategy: CheckoutStrategy = .safe,
 	                        checkoutProgress: CheckoutProgressBlock? = nil) -> Result<Repository, NSError> {
-		var options = cloneOptions(
-			bare: bare,
-			localClone: localClone,
-			fetchOptions: fetchOptions(credentials: credentials),
-			checkoutOptions: checkoutOptions(strategy: checkoutStrategy, progress: checkoutProgress))
+		LibGit2Bootstrap.ensureInitialized
+		let payload = RemoteCallbackPayload(credentials: credentials)
+		return withExtendedLifetime(payload) { () -> Result<Repository, NSError> in
+			var options = cloneOptions(
+				bare: bare,
+				localClone: localClone,
+				fetchOptions: fetchOptions(payload: Unmanaged.passUnretained(payload).toOpaque()),
+				checkoutOptions: checkoutOptions(strategy: checkoutStrategy, progress: checkoutProgress))
 
-		var pointer: OpaquePointer? = nil
-		let remoteURLString = (remoteURL as NSURL).isFileReferenceURL() ? remoteURL.path : remoteURL.absoluteString
-		let result = localURL.withUnsafeFileSystemRepresentation { localPath in
-			git_clone(&pointer, remoteURLString, localPath, &options)
+			var pointer: OpaquePointer? = nil
+			let remoteURLString = (remoteURL as NSURL).isFileReferenceURL() ? remoteURL.path : remoteURL.absoluteString
+			let result = localURL.withUnsafeFileSystemRepresentation { localPath in
+				git_clone(&pointer, remoteURLString, localPath, &options)
+			}
+
+			guard result == GIT_OK.rawValue else {
+				if result == GIT_EUSER.rawValue && payload.credentialAttemptsExhausted {
+					return Result.failure(payload.makeAuthenticationError())
+				}
+				return Result.failure(NSError(gitError: result, pointOfFailure: "git_clone"))
+			}
+
+			let repository = Repository(pointer!)
+			return Result.success(repository)
 		}
-
-		guard result == GIT_OK.rawValue else {
-			return Result.failure(NSError(gitError: result, pointOfFailure: "git_clone"))
-		}
-
-		let repository = Repository(pointer!)
-		return Result.success(repository)
 	}
 
 	// MARK: - Initializers
@@ -329,8 +316,8 @@ public final class Repository {
 			}
 
 			let error = NSError(
-				domain: "org.libgit2.SwiftGit2",
-				code: 1,
+				domain: libGit2ErrorDomain,
+				code: Int(GIT_ERROR.rawValue),
 				userInfo: [
 					NSLocalizedDescriptionKey: "Unrecognized git_object_t '\(type)' for oid '\(oid)'.",
 				]
@@ -439,29 +426,57 @@ public final class Repository {
 		return callback(.success(pointer!))
 	}
 
+	/// A remote that exists in config but can't be represented — no name or no fetch URL (e.g.
+	/// a hand-edited `[remote "…"]` section that only sets `pushurl`). Reported as a failure
+	/// rather than crashing on a force-unwrap: user-owned repositories are exactly where
+	/// malformed config shows up. Added for anglesite/SwiftGit2 (Anglesite-app#653).
+	private static func invalidRemoteError(named name: String) -> NSError {
+		return NSError(
+			domain: libGit2ErrorDomain,
+			code: Int(GIT_ERROR.rawValue),
+			userInfo: [
+				NSLocalizedDescriptionKey:
+					"remote '\(name)' has no fetch URL configured (check this repository's .git/config).",
+				NSLocalizedFailureReasonErrorKey: "git_remote_lookup returned a remote without a name or URL.",
+			]
+		)
+	}
+
 	/// Load a remote from the repository.
 	///
 	/// name - The name of the remote.
 	///
 	/// Returns the remote if it exists, or an error.
 	public func remote(named name: String) -> Result<Remote, NSError> {
-		return remoteLookup(named: name) { $0.map(Remote.init) }
+		return remoteLookup(named: name) { lookup in
+			lookup.flatMap { pointer in
+				guard let remote = Remote(pointer) else {
+					return .failure(Repository.invalidRemoteError(named: name))
+				}
+				return .success(remote)
+			}
+		}
 	}
 
-	/// Download new data and update tips
-	public func fetch(_ remote: Remote) -> Result<(), NSError> {
-		return remoteLookup(named: remote.name) { remote in
-			remote.flatMap { pointer in
-				var opts = git_fetch_options()
-				let resultInit = git_fetch_init_options(&opts, UInt32(GIT_FETCH_OPTIONS_VERSION))
-				assert(resultInit == GIT_OK.rawValue)
-
-				let result = git_remote_fetch(pointer, nil, &opts, nil)
-				guard result == GIT_OK.rawValue else {
-					let err = NSError(gitError: result, pointOfFailure: "git_remote_fetch")
-					return .failure(err)
+	/// Download new data and update tips, authenticating with `credentials` when the remote
+	/// asks. (The previous implementation dropped credentials entirely — it built default fetch
+	/// options with no credential callback, so any fetch that needed authentication failed.
+	/// Changed for anglesite/SwiftGit2, Anglesite-app#653.)
+	public func fetch(_ remote: Remote, credentials: Credentials = .default) -> Result<(), NSError> {
+		return remoteLookup(named: remote.name) { lookup in
+			lookup.flatMap { remotePointer in
+				let payload = RemoteCallbackPayload(credentials: credentials)
+				return withExtendedLifetime(payload) { () -> Result<(), NSError> in
+					var options = fetchOptions(payload: Unmanaged.passUnretained(payload).toOpaque())
+					let result = git_remote_fetch(remotePointer, nil, &options, nil)
+					guard result == GIT_OK.rawValue else {
+						if result == GIT_EUSER.rawValue && payload.credentialAttemptsExhausted {
+							return .failure(payload.makeAuthenticationError())
+						}
+						return .failure(NSError(gitError: result, pointOfFailure: "git_remote_fetch"))
+					}
+					return .success(())
 				}
-				return .success(())
 			}
 		}
 	}
@@ -475,7 +490,10 @@ public final class Repository {
 			return .failure(NSError(gitError: result, pointOfFailure: "git_remote_create"))
 		}
 		defer { git_remote_free(pointer) }
-		return .success(Remote(pointer))
+		guard let remote = Remote(pointer) else {
+			return .failure(Repository.invalidRemoteError(named: name))
+		}
+		return .success(remote)
 	}
 
 	/// Push `refspec` to the named remote — `git push <remote> <refspec>` — authenticating via
@@ -487,21 +505,22 @@ public final class Repository {
 	public func push(remoteName: String, refspec: String, credentials: Credentials = .default) -> Result<(), NSError> {
 		return remoteLookup(named: remoteName) { lookup in
 			lookup.flatMap { remote in
-				let payload = PushCallbackPayload(credentials: credentials)
+				let payload = RemoteCallbackPayload(credentials: credentials)
 				return withExtendedLifetime(payload) {
 					var options = git_push_options()
 					let resultInit = git_push_init_options(&options, UInt32(GIT_PUSH_OPTIONS_VERSION))
 					assert(resultInit == GIT_OK.rawValue)
 					options.callbacks.payload = Unmanaged.passUnretained(payload).toOpaque()
-					options.callbacks.credentials = pushCredentialsCallback
+					options.callbacks.credentials = credentialsCallback
 					options.callbacks.push_update_reference = pushUpdateReferenceCallback
 
-					var refspecPointer = UnsafeMutablePointer<Int8>(mutating: (refspec as NSString).utf8String)
-					var refspecs = withUnsafeMutablePointer(to: &refspecPointer) {
-						git_strarray(strings: $0, count: 1)
+					let result = withGitStrarray([refspec]) { refspecs in
+						git_remote_push(remote, &refspecs, &options)
 					}
-					let result = git_remote_push(remote, &refspecs, &options)
 					guard result == GIT_OK.rawValue else {
+						if result == GIT_EUSER.rawValue && payload.credentialAttemptsExhausted {
+							return .failure(payload.makeAuthenticationError())
+						}
 						return .failure(NSError(gitError: result, pointOfFailure: "git_remote_push"))
 					}
 					guard payload.rejections.isEmpty else {
@@ -746,13 +765,11 @@ public final class Repository {
 
 	/// Stage the file(s) under the specified path.
 	public func add(path: String) -> Result<(), NSError> {
-		var dirPointer = UnsafeMutablePointer<Int8>(mutating: (path as NSString).utf8String)
-		var paths = withUnsafeMutablePointer(to: &dirPointer) {
-			git_strarray(strings: $0, count: 1)
-		}
 		return unsafeIndex().flatMap { index in
 			defer { git_index_free(index) }
-			let addResult = git_index_add_all(index, &paths, 0, nil, nil)
+			let addResult = withGitStrarray([path]) { paths in
+				git_index_add_all(index, &paths, 0, nil, nil)
+			}
 			guard addResult == GIT_OK.rawValue else {
 				return .failure(NSError(gitError: addResult, pointOfFailure: "git_index_add_all"))
 			}
@@ -838,19 +855,17 @@ public final class Repository {
 	/// repository in a state where the file is gone from disk with no commit recording its
 	/// removal. Added for anglesite/SwiftGit2 (Anglesite-app#640).
 	public func restorePathFromHEAD(_ path: String) -> Result<(), NSError> {
-		var dirPointer = UnsafeMutablePointer<Int8>(mutating: (path as NSString).utf8String)
-		let paths = withUnsafeMutablePointer(to: &dirPointer) {
-			git_strarray(strings: $0, count: 1)
+		return withGitStrarray([path]) { paths in
+			var options = git_checkout_options()
+			git_checkout_init_options(&options, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
+			options.checkout_strategy = GIT_CHECKOUT_FORCE.rawValue
+			options.paths = paths
+			let result = git_checkout_head(self.pointer, &options)
+			guard result == GIT_OK.rawValue else {
+				return .failure(NSError(gitError: result, pointOfFailure: "git_checkout_head"))
+			}
+			return .success(())
 		}
-		var options = git_checkout_options()
-		git_checkout_init_options(&options, UInt32(GIT_CHECKOUT_OPTIONS_VERSION))
-		options.checkout_strategy = GIT_CHECKOUT_FORCE.rawValue
-		options.paths = paths
-		let result = git_checkout_head(self.pointer, &options)
-		guard result == GIT_OK.rawValue else {
-			return .failure(NSError(gitError: result, pointOfFailure: "git_checkout_head"))
-		}
-		return .success(())
 	}
 
 	/// Perform a commit with arbitrary numbers of parent commits.
@@ -1196,6 +1211,7 @@ public final class Repository {
 	///   `.success(false)` if there isn't,
 	///   and a `.failure` if there's been an error.
 	public static func isValid(url: URL) -> Result<Bool, NSError> {
+		LibGit2Bootstrap.ensureInitialized
 		var pointer: OpaquePointer?
 
 		let result = url.withUnsafeFileSystemRepresentation {

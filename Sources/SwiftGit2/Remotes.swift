@@ -19,8 +19,17 @@ public struct Remote: Hashable {
 	public let URL: String
 
 	/// Create an instance with a libgit2 `git_remote`.
-	public init(_ pointer: OpaquePointer) {
-		name = String(validatingUTF8: git_remote_name(pointer))!
-		URL = String(validatingUTF8: git_remote_url(pointer))!
+	///
+	/// Fails (returns nil) when the underlying remote has no name (an in-memory/anonymous
+	/// remote) or no fetch URL — e.g. a hand-edited `.git/config` whose `[remote "…"]` section
+	/// only sets `pushurl`. The previous force-unwraps turned that user-editable state into a
+	/// crash of the calling process. Changed for anglesite/SwiftGit2 (Anglesite-app#653).
+	public init?(_ pointer: OpaquePointer) {
+		guard let name = git_remote_name(pointer).flatMap({ String(validatingUTF8: $0) }),
+		      let url = git_remote_url(pointer).flatMap({ String(validatingUTF8: $0) }) else {
+			return nil
+		}
+		self.name = name
+		self.URL = url
 	}
 }
