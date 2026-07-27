@@ -47,8 +47,10 @@ swift test                           # Swift Testing (@Suite/@Test), not XCTest/
 - macOS/iOS-family platforms only (see `Package.swift`); the app consumes it Darwin-only.
   There is no Linux support — libgit2 is compiled with Darwin-specific defines
   (SecureTransport, CommonCrypto).
-- Test suites that touch shared libgit2 state run `.serialized` — keep that on new suites;
-  uncoordinated concurrent libgit2 use is unsafe.
+- Test suites that share a `Repository` or a fixture directory run `.serialized` — keep that on
+  new suites. It is *not* needed for libgit2's own shared state any more: the package is built
+  with `GIT_THREADS` (Anglesite-app#994), so errors and mutexes are genuinely per-thread.
+  `AnglesiteThreadSafetySpec` is deliberately unserialized because that is what it tests.
 - CI (`.github/workflows/`) runs on pull requests (any base branch for `BuildPR.yml`;
   `test.yml` filters to `main`/`develop`/`anglesite/main`) and on pushes to those branches.
 
@@ -112,4 +114,7 @@ Sandbox blocks that exec just like it blocks `git`.
 - Prefer the typed `NSError` helpers (`isLibGit2NotFound`, `isLibGit2AuthenticationFailure`,
   `libGit2ErrorCode`) over string-matching `localizedDescription`.
 - `NSError(gitError:)` reads `giterr_last()`, which is thread-local — build the error on the
-  same thread that made the failing libgit2 call.
+  same thread that made the failing libgit2 call. (Thread-local only because `Package.swift`
+  defines `GIT_THREADS`; without it libgit2 keeps that state in a process-wide array, which is
+  how Anglesite-app#994 crashed. `LIBGIT2_NO_FEATURES_H` means no feature is inferred from the
+  platform — if it isn't in that define list, libgit2 is built without it.)
