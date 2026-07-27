@@ -91,6 +91,17 @@ let package = Package(
                 .define("GIT_QSORT_BSD", to: "1"),
                 .define("GIT_IO_POLL", to: "1"),
 
+                // Thread safety. libgit2's CMake build defaults this on (USE_THREADS=ON, which
+                // sets GIT_THREADS 1 and links pthreads — already in libSystem on Darwin), but
+                // LIBGIT2_NO_FEATURES_H means nothing here is inferred: every feature is whatever
+                // this list says. Without it, src/util/thread.c compiles its `#if
+                // !defined(GIT_THREADS)` branch, where git_tlsdata_* is backed by a *process-wide*
+                // `static tlsdata_value tlsdata_values[16]` rather than real TLS, and git_mutex_*
+                // become no-ops. libgit2 keeps its error state in that storage, so two concurrent
+                // calls grow one shared git_str and abort the process in realloc
+                // (Anglesite-app#994).
+                .define("GIT_THREADS", to: "1"),
+
                 // Git regex configuration
                 .define("GIT_REGEX_BUILTIN", to: "1"),
                 .define("PCRE_LINK_SIZE", to: "2"),
