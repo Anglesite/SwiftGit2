@@ -69,6 +69,10 @@ From `Sources/AnglesiteCore` in Anglesite-app (`SwiftGit2Bootstrap`, `InProcessG
 - `Repository.defaultSignature()`, `commit(message:signature:)` (must keep working on an
   unborn HEAD — that's the fork's founding patch, see below)
 - `Repository.push(remoteName:refspec:credentials:)`, `addRemote(named:url:)`
+- `Repository.unbundle(at:)` → `BundleHeader`, plus `swiftGit2BundleErrorDomain` / `BundleError`
+  (`Bundle.swift`) — libgit2 has no bundle API at all, so this parses the plain-text header
+  itself and hands the pack to `git_odb_write_pack`. Read side only; bundle *creation* does not
+  exist here yet (Anglesite-app#655 will need it).
 - `Credentials.plaintext` (HTTPS token auth) and `.default`
 - `Diff.Status`, `StatusEntry`, `Branch`, `Signature`, `OID`
 
